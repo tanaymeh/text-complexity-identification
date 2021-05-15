@@ -43,14 +43,13 @@ class Trainer:
         self.model.train()
         with autocast():
             for idx, inputs in prog_bar:
-                ids = inputs['ids'].to(self.device, dtype=torch.long)
-                mask = inputs['mask'].to(self.device, dtype=torch.long)
-                ttis = inputs['token_type_ids'].to(self.device, dtype=torch.long)
+                ids = inputs['inputs'].to(self.device, dtype=torch.long)
+                mask = inputs['attention_mask'].to(self.device, dtype=torch.long)
                 targets = inputs['targets'].to(self.device, dtype=torch.float)
 
-                outputs = self.model(ids=ids, mask=mask, token_type_ids=ttis)            
+                outputs = self.model(input_ids=ids, attention_mask=mask)           
 
-                loss = self.loss_fn(outputs, targets)
+                loss = self.loss_fn(outputs.squeeze(1), targets)
                 prog_bar.set_description('loss: {:.2f}'.format(loss.item()))
 
                 Config.scaler.scale(loss).backward()
@@ -70,14 +69,13 @@ class Trainer:
         all_predictions = []
         with torch.no_grad():
             for idx, inputs in prog_bar:
-                ids = inputs['ids'].to(self.device, dtype=torch.long)
-                mask = inputs['mask'].to(self.device, dtype=torch.long)
-                ttis = inputs['token_type_ids'].to(self.device, dtype=torch.long)
+                ids = inputs['inputs'].to(self.device, dtype=torch.long)
+                mask = inputs['attention_mask'].to(self.device, dtype=torch.long)
                 targets = inputs['targets'].to(self.device, dtype=torch.float)
 
-                outputs = self.model(ids=ids, mask=mask, token_type_ids=ttis)
+                outputs = self.model(input_ids=ids, attention_mask=mask)
                 all_targets.extend(targets.cpu().detach().numpy().tolist())
-                all_predictions.extend(torch.sigmoid(outputs).cpu().detach().numpy().tolist())
+                all_predictions.extend(outputs.cpu().detach().numpy().tolist())
 
         val_rmse_loss = np.sqrt(mean_squared_error(all_targets, all_predictions))
         print('Validation RMSE: {:.2f}'.format(val_rmse_loss))

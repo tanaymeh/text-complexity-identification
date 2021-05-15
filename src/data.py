@@ -49,3 +49,38 @@ class BERTDataset(Dataset):
                 'token_type_ids': token_type_ids,
                 'targets': targets
             }
+            
+class DistilBERTData(Dataset):
+    def __init__(self, text, target=None, is_test=False):
+        super(DistilBERTData, self).__init__()
+        self.text = text
+        self.target = target
+        self.is_test = is_test
+    
+    def __len__(self):
+        return len(self.text)
+    
+    def __getitem__(self, index):
+        text = str(self.text[index])
+        text = ' '.join(text.split())
+        
+        inputs = Config.tokenizer(text, 
+                                  truncation=True, 
+                                  padding=True, 
+                                  return_tensors='pt', 
+                                  add_special_tokens=True
+                                )
+        
+        input_ids = torch.tensor(inputs['input_ids'], dtype=torch.long)
+        attention_mask = torch.tensor(inputs['attention_mask'], dtype=torch.long)
+        
+        if self.is_test:
+            return {'inputs': input_ids,
+                    'attention_mask': attention_mask
+                    }
+        else:
+            return {'inputs': input_ids,
+                    'attention_mask': attention_mask,
+                    'targets': torch.tensor(self.target[index], dtype=torch.float)
+                    }
+        
