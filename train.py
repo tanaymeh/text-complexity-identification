@@ -3,123 +3,148 @@ import gc
 import platform
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 import matplotlib.pyplot as plt
+from sklearn.metrics import mean_squared_error
+from sklearn.model_selection import StratifiedKFold
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
 
 import transformers
-from transformers import AutoModel, AutoTokenizer
-from torch.utils.data import DataLoader, Dataset
 
-from sklearn.model_selection import StratifiedKFold
+import torch_xla
+import torch_xla.debug.metrics as met
+import torch_xla.distributed.parallel_loader as pl
+import torch_xla.utils.utils as xu
+import torch_xla.utils.serialization as xser
+import torch_xla.core.xla_model as xm
+import torch_xla.distributed.xla_multiprocessing as xmp
+import torch_xla.test.test_utils as test_utils
 
+from src.dataset import CLRPData
 from src.config import Config
-from src.data import DistilBERTData
-from src.models import TextRegressionModel
-from src.trainer import Trainer
+from src.models import XLMModel
+from src.functions import train_fn, valid_fn
 
-def yield_optimizer(model):
-    """
-    Returns optimizer for specific parameters
-    """
-    param_optimizer = list(model.named_parameters())
-    no_decay = ["bias", "LayerNorm.bias", "LayerNorm.weight"]
-    optimizer_parameters = [
-        {
-            "params": [
-                p for n, p in param_optimizer if not any(nd in n for nd in no_decay)
-            ],
-            "weight_decay": 0.003,
-        },
-        {
-            "params": [
-                p for n, p in param_optimizer if any(nd in n for nd in no_decay)
-            ],
-            "weight_decay": 0.0,
-        },
-    ]
-    return transformers.AdamW(optimizer_parameters, lr=Config.LR)
+modelWrap = xmp.MpModelWrapper(XLMModel(Config=Config))
 
-# Training Code
-if __name__ == '__main__':
-    if torch.cuda.is_available():
-        print("[INFO] Using GPU: {}\n".format(torch.cuda.get_device_name()))
-        DEVICE = torch.device('cuda:0')
-    else:
-        print("\n[INFO] GPU not found. Using CPU: {}\n".format(platform.processor()))
-        DEVICE = torch.device('cpu')
-    
+def prepare_dataset():
     data = pd.read_csv(Config.FILE_NAME)
     data = data.sample(frac=1).reset_index(drop=True)
     data = data[['excerpt', 'target']]
+    train_count = 2700
     
-    # Do Kfolds training and cross validation
-    kf = StratifiedKFold(n_splits=Config.N_SPLITS)
-    nb_bins = int(np.floor(1 + np.log2(len(data))))
-    data.loc[:, 'bins'] = pd.cut(data['target'], bins=nb_bins, labels=False)
+    train_data = data[:train_count]
+    valid_data = data[train_count:]
     
-    for fold, (train_idx, valid_idx) in enumerate(kf.split(X=data, y=data['bins'].values)):
-        print(f"Fold: {fold}")
-        print('-'*20)
+    train_set = CLRPData(
+        review=train_data['excerpt'],
+        target=train_data['target'],
+        is_test=False
+    )
+    
+    valid_set = CLRPData(
+        review=valid_data['excerpt'],
+        target=valid_data['target'],
+        is_test=False
+    )
+    
+    return train_set, valid_set
+
+def _run():
+    """
+    Binds the entire training process together in one routine
+    """
+    gc.collect()
+    
+    xm.master_print('Starting Run...')
+    
+    train_dataset, valid_dataset = prepare_dataset()
+    
+    train_sampler = torch.utils.data.distributed.DistributedSampler(
+        train_dataset,
+        num_replicas=xm.xrt_world_size(),
+        rank=xm.get_ordinal(),
+        shuffle=False
+    )
+
+    train_dataloader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=Config.TRAIN_BS,
+        sampler=train_sampler,
+        drop_last=False,
+        num_workers=8
+    )
+    
+    valid_sampler = torch.utils.data.distributed.DistributedSampler(
+        valid_dataset,
+        num_replicas=xm.xrt_world_size(),
+        rank=xm.get_ordinal(),
+        shuffle=False
+    )
+
+    valid_data_loader = torch.utils.data.DataLoader(
+        valid_dataset,
+        batch_size=Config.VALID_BS,
+        sampler=valid_sampler,
+        drop_last=False,
+        num_workers=4
+    )
+    
+    gc.collect()
+    
+    device = xm.xla_device()
+    model = modelWrap.to(device)
+    xm.master_print('Model Loaded')
+    
+    num_train_steps = int(2834 / Config.TRAIN_BS / xm.xrt_world_size())
+
+    optimizer = transformers.AdamW([{'params': model.roberta.parameters(), 'lr': Config.LR},
+                    {'params': [param for name, param in model.named_parameters() if 'roberta' not in name], 'lr': 1e-3} ], lr=LR, weight_decay=0)
+
+    scheduler = transformers.get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps = 0,
+        num_training_steps = num_train_steps * Config.EPOCHS
+    )
+    
+    for epoch in range(Config.EPOCHS):
+        train_sampler.set_epoch(epoch)
         
-        train_data = data.loc[train_idx]
-        valid_data = data.loc[valid_idx]
+        para_loader = pl.ParallelLoader(train_dataloader, [device])
+        xm.master_print('parallel loader created... training now')
+        train_fn(para_loader.per_device_loader(device), model, optimizer, device, scheduler=scheduler, epoch_conf=[epoch, Config.EPOCHS])
         
-        train_set = DistilBERTData(
-            review = train_data['excerpt'].values,
-            target = train_data['target'].values
-        )
-
-        valid_set = DistilBERTData(
-            review = valid_data['excerpt'].values,
-            target = valid_data['target'].values
-        )
-
-        train = DataLoader(
-            train_set,
-            batch_size = Config.TRAIN_BS,
-            shuffle = True,
-            num_workers=8
-        )
-
-        valid = DataLoader(
-            valid_set,
-            batch_size = Config.VALID_BS,
-            shuffle = False,
-            num_workers=8
-        )
-
-        model = TextRegressionModel().to(DEVICE)
-        nb_train_steps = int(len(train_data) / Config.TRAIN_BS * Config.NB_EPOCHS)
-        optimizer = yield_optimizer(model)
-        scheduler = transformers.get_linear_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=0,
-            num_training_steps=nb_train_steps
-        )
-
-        trainer = Trainer(model, optimizer, scheduler, train, valid, DEVICE)
-
-        best_loss = 100
-        for epoch in range(1, Config.NB_EPOCHS+1):
-            print(f"\n{'--'*5} EPOCH: {epoch} {'--'*5}\n")
-
-            # Train for 1 epoch
-            trainer.train_one_epoch()
-
-            # Validate for 1 epoch
-            current_loss = trainer.valid_one_epoch()
-
-            if current_loss < best_loss:
-                print(f"Saving best model in this fold: {current_loss:.4f}")
-                torch.save(trainer.get_model().state_dict(), f"bert_base_uncased_fold_{fold}.pt")
-                best_loss = current_loss
-        
-        print(f"Best RMSE in fold: {fold} was: {best_loss:.4f}")
-        print(f"Final RMSE in fold: {fold} was: {current_loss:.4f}")
-        
-        del train_set, valid_set, train, valid, model, optimizer, scheduler, trainer, current_loss
+        del para_loader
         gc.collect()
-        torch.cuda.empty_cache()
+        
+        # using xm functionality for memory-reduced model saving
+        if epoch == Config.EPOCHS-1:
+            xm.master_print('saving model')
+            xser.save(model.state_dict(), f"./model.bin", master_only=True)
+            xm.master_print('Model Saved.')
+        
+        para_loader = pl.ParallelLoader(valid_data_loader, [device])
+        _, _, _ = valid_fn(para_loader.per_device_loader(device), model, device, epoch_conf=[epoch, Config.EPOCHS])
+
+        gc.collect()
+        
+        del para_loader
+        
+# Start training processes
+def _mp_fn(rank, flags):
+    
+    # not the cleanest way, but works
+    # collect individual core outputs and save
+    # can also do test inference outside training routine loading saved model
+    test_preds, test_index = _run()
+    np.save(f"test_preds_{rank}", test_preds)
+    np.save(f"test_index_{rank}", test_index)
+    return test_preds
+
+if __name__ == '__main__':
+    FLAGS={}
+    xmp.spawn(_mp_fn, args=(FLAGS,), nprocs=8, start_method='fork')
